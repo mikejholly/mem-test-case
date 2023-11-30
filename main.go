@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -71,9 +70,8 @@ func main() {
 		result := gwclient.NewResult()
 
 		idx := atomic.Int32{}
-		mu := sync.Mutex{}
 
-		for i := 0; i < 100; i++ {
+		for i := 0; i < 10000; i++ {
 
 			randDir := fmt.Sprintf("/tmp/%s", strconv.Itoa(time.Now().Nanosecond()))
 
@@ -105,9 +103,8 @@ func main() {
 				return nil, errors.Wrap(err, "unlazy force execution")
 			}
 
-			mu.Lock()
+			idx.Add(1)
 			result.AddRef(fmt.Sprintf("ref_%d", idx.Load()), ref)
-			mu.Unlock()
 		}
 
 		return result, nil
