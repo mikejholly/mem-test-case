@@ -10,7 +10,7 @@ import (
 	"github.com/moby/buildkit/client/llb"
 	gwclient "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/util/system"
-	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 )
 
 func buildkitAddr() string {
@@ -21,16 +21,7 @@ func buildkitAddr() string {
 	return buildkitAddr
 }
 
-func baseState(ctx context.Context, gwClient gwclient.Client) (*llb.State, error) {
-	st := llb.Image("docker.io/library/golang:1.17-alpine").
-		AddEnv("PATH", "/usr/local/go/bin:"+system.DefaultPathEnvUnix).
-		File(llb.Mkdir("/opt", os.ModeDir)).
-		Dir("/opt").
-		File(llb.Copy(llb.Local("src"), "hello-world/main.go", ".")).
-		File(llb.Copy(llb.Local("src"), "hello-world/go.mod", ".")).
-		Run(llb.Shlex("go build -o hello-world main.go")).
-		Root()
-
+func buildLLB(ctx context.Context, gwClient gwclient.Client, st *llb.State) (*llb.State, error) {
 	def, err := st.Marshal(ctx)
 	if err != nil {
 		return nil, err
@@ -53,7 +44,31 @@ func baseState(ctx context.Context, gwClient gwclient.Client) (*llb.State, error
 		return nil, err
 	}
 
-	return &st, nil
+	return st, nil
+}
+
+func baseState(ctx context.Context, gwClient gwclient.Client) (*llb.State, error) {
+	a := llb.Image("docker.io/library/golang:1.17-alpine").
+		AddEnv("PATH", "/usr/local/go/bin:"+system.DefaultPathEnvUnix).
+		File(llb.Mkdir("/opt", os.ModeDir)).
+		Dir("/opt").
+		File(llb.Copy(llb.Local("src"), "hello-world/main.go", ".")).
+		File(llb.Copy(llb.Local("src"), "hello-world/go.mod", ".")).
+		Run(llb.Shlex("go build -o hello-world main.go")).
+		Root()
+
+	_, err := buildLLB(ctx, gwClient, &a)
+	if err != nil {
+		return nil, err
+	}
+
+	last := a
+	for i := 0; i < 200; i++ {
+		cmd := fmt.Sprintf("echo hello-world-%d", i)
+		last = last.Run(llb.Shlex(cmd)).Root()
+	}
+
+	return &last, err
 }
 
 func main() {
@@ -73,45 +88,57 @@ func main() {
 
 		idx := atomic.Int32{}
 
-		for i := 0; i < 100000; i++ {
+		eg, ctx := errgroup.WithContext(ctx)
 
-			st, err := baseState(ctx, gwClient)
-			if err != nil {
-				return nil, err
-			}
+		eg.SetLimit(10)
 
-			file := fmt.Sprintf("/tmp/%d.txt", idx.Load())
+		for i := 0; i < 1000; i++ {
+			eg.Go(func() error {
+				st, err := baseState(ctx, gwClient)
+				if err != nil {
+					return err
+				}
 
-			appStage := llb.Image("docker.io/library/golang:1.17-alpine").
-				File(llb.Mkdir(file, os.ModeDir)).
-				Run(llb.Shlex("echo hi > " + file)).
-				Run(llb.Shlex("ls -l " + file)).
-				File(llb.Copy(*st, "/opt/hello-world", file))
+				file := fmt.Sprintf("/tmp/%d.txt", idx.Load())
 
-			def, err := appStage.Marshal(ctx)
-			if err != nil {
-				return nil, err
-			}
+				appStage := llb.Image("docker.io/library/golang:1.17-alpine").
+					File(llb.Mkdir(file, os.ModeDir)).
+					Run(llb.Shlex("echo hi > " + file)).
+					Run(llb.Shlex("ls -l " + file)).
+					File(llb.Copy(*st, "/opt/hello-world", file))
 
-			r, err := gwClient.Solve(ctx, gwclient.SolveRequest{
-				Definition: def.ToPB(),
+				def, err := appStage.Marshal(ctx)
+				if err != nil {
+					return err
+				}
+
+				r, err := gwClient.Solve(ctx, gwclient.SolveRequest{
+					Definition: def.ToPB(),
+				})
+				if err != nil {
+					return err
+				}
+
+				ref, err := r.SingleRef()
+				if err != nil {
+					return err
+				}
+
+				_, err = ref.ReadDir(ctx, gwclient.ReadDirRequest{Path: "/"})
+				if err != nil {
+					return err
+				}
+
+				idx.Add(1)
+				result.AddRef(fmt.Sprintf("ref_%d", idx.Load()), ref)
+
+				return nil
 			})
-			if err != nil {
-				return nil, err
-			}
+		}
 
-			ref, err := r.SingleRef()
-			if err != nil {
-				return nil, err
-			}
-
-			_, err = ref.ReadDir(ctx, gwclient.ReadDirRequest{Path: "/"})
-			if err != nil {
-				return nil, errors.Wrap(err, "unlazy force execution")
-			}
-
-			idx.Add(1)
-			result.AddRef(fmt.Sprintf("ref_%d", idx.Load()), ref)
+		err := eg.Wait()
+		if err != nil {
+			return nil, err
 		}
 
 		return result, nil
@@ -145,7 +172,10 @@ func logStatus(ch chan *client.SolveStatus) {
 			break
 		}
 		for _, v := range status.Vertexes {
-			fmt.Printf("%s - cached: %t\n", v.Name, v.Cached)
+			if v.Cached {
+				fmt.Printf("CACHED ")
+			}
+			fmt.Printf("%s\n", v.Name)
 		}
 	}
 }
