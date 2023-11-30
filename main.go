@@ -4,13 +4,16 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
 	gwclient "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/util/system"
-	"golang.org/x/sync/errgroup"
+	"github.com/pkg/errors"
 )
 
 func buildkitAddr() string {
@@ -40,14 +43,10 @@ func main() {
 			Dir("/opt").
 			File(llb.Copy(llb.Local("src"), "hello-world/main.go", ".")).
 			File(llb.Copy(llb.Local("src"), "hello-world/go.mod", ".")).
-			Run(llb.Shlex("go build -o hello-world main.go")).Root()
+			Run(llb.Shlex("go build -o hello-world main.go")).
+			Root()
 
-		testStage := baseStage.
-			Run(llb.Shlex("go test ./...")).Root()
-
-		result := gwclient.NewResult()
-
-		def, err := testStage.Marshal(ctx)
+		def, err := baseStage.Marshal(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -61,73 +60,70 @@ func main() {
 
 		ref, err := r.SingleRef()
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "single ref")
 		}
 
-		eg, solveCtx := errgroup.WithContext(ctx)
+		_, err = ref.ReadDir(ctx, gwclient.ReadDirRequest{Path: "/"})
+		if err != nil {
+			return nil, errors.Wrap(err, "unlazy force execution")
+		}
 
-		eg.SetLimit(5)
+		result := gwclient.NewResult()
 
 		idx := atomic.Int32{}
+		mu := sync.Mutex{}
 
 		for i := 0; i < 100; i++ {
-			eg.Go(func() error {
-				ctx := solveCtx
 
-				start, err := ref.ToState()
-				if err != nil {
-					return err
-				}
+			randDir := fmt.Sprintf("/tmp/%s", strconv.Itoa(time.Now().Nanosecond()))
 
-				buildStage := start.
-					Run(llb.Shlex("go build -o hello-world main.go")).Root()
+			appStage := llb.Scratch().
+				AddEnv("PATH", randDir).
+				File(llb.Mkdir("/tmp", os.ModeDir)).
+				File(llb.Mkdir(randDir, os.ModeDir)).
+				File(llb.Copy(baseStage, "/opt/hello-world", randDir))
 
-				appStage := llb.Scratch().
-					AddEnv("PATH", "/bin").
-					File(llb.Mkdir("/bin", os.ModeDir)).
-					File(llb.Copy(buildStage, "/opt/hello-world", "/bin/"))
+			def, err := appStage.Marshal(ctx)
+			if err != nil {
+				return nil, err
+			}
 
-				def, err := appStage.Marshal(ctx)
-				if err != nil {
-					return err
-				}
-
-				r, err := gwClient.Solve(ctx, gwclient.SolveRequest{
-					Definition: def.ToPB(),
-				})
-				if err != nil {
-					return err
-				}
-
-				ref, err := r.SingleRef()
-				if err != nil {
-					return err
-				}
-
-				data, err := ref.ReadFile(ctx, gwclient.ReadRequest{
-					Filename: "/opt/hello-world",
-				})
-				if err != nil {
-					return fmt.Errorf("error reading file from reference: %w", err)
-				}
-
-				fmt.Printf("File length: %q\n", len(data))
-
-				idx.Add(1)
-				result.AddRef(fmt.Sprintf("ref_%d", idx.Load()), ref)
-
-				return nil
+			r, err := gwClient.Solve(ctx, gwclient.SolveRequest{
+				Definition: def.ToPB(),
 			})
-		}
+			if err != nil {
+				return nil, err
+			}
 
-		if err := eg.Wait(); err != nil {
-			return nil, err
+			ref, err := r.SingleRef()
+			if err != nil {
+				return nil, err
+			}
+
+			_, err = ref.ReadDir(ctx, gwclient.ReadDirRequest{Path: "/"})
+			if err != nil {
+				return nil, errors.Wrap(err, "unlazy force execution")
+			}
+
+			mu.Lock()
+			result.AddRef(fmt.Sprintf("ref_%d", idx.Load()), ref)
+			mu.Unlock()
 		}
 
 		return result, nil
 	}
 
-	solveOpt := client.SolveOpt{}
+	localPath, err := os.Getwd()
+	if err != nil {
+		fmt.Printf("failed to current path: %v\n", err)
+		os.Exit(1)
+	}
+
+	solveOpt := client.SolveOpt{
+		LocalDirs: map[string]string{
+			"src": localPath,
+		},
+	}
 
 	resp, err := bkClient.Build(context.TODO(), solveOpt, "", buildFunc, ch)
 	if err != nil {
