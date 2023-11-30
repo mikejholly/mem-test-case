@@ -4,9 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strconv"
 	"sync/atomic"
-	"time"
 
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
@@ -23,6 +21,41 @@ func buildkitAddr() string {
 	return buildkitAddr
 }
 
+func baseState(ctx context.Context, gwClient gwclient.Client) (*llb.State, error) {
+	st := llb.Image("docker.io/library/golang:1.17-alpine").
+		AddEnv("PATH", "/usr/local/go/bin:"+system.DefaultPathEnvUnix).
+		File(llb.Mkdir("/opt", os.ModeDir)).
+		Dir("/opt").
+		File(llb.Copy(llb.Local("src"), "hello-world/main.go", ".")).
+		File(llb.Copy(llb.Local("src"), "hello-world/go.mod", ".")).
+		Run(llb.Shlex("go build -o hello-world main.go")).
+		Root()
+
+	def, err := st.Marshal(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	r, err := gwClient.Solve(ctx, gwclient.SolveRequest{
+		Definition: def.ToPB(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	ref, err := r.SingleRef()
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = ref.ReadDir(ctx, gwclient.ReadDirRequest{Path: "/"})
+	if err != nil {
+		return nil, err
+	}
+
+	return &st, nil
+}
+
 func main() {
 	bkClient, err := client.New(context.TODO(), buildkitAddr())
 	if err != nil {
@@ -36,50 +69,24 @@ func main() {
 
 	buildFunc := func(ctx context.Context, gwClient gwclient.Client) (*gwclient.Result, error) {
 
-		baseStage := llb.Image("docker.io/library/golang:1.17-alpine").
-			AddEnv("PATH", "/usr/local/go/bin:"+system.DefaultPathEnvUnix).
-			File(llb.Mkdir("/opt", os.ModeDir)).
-			Dir("/opt").
-			File(llb.Copy(llb.Local("src"), "hello-world/main.go", ".")).
-			File(llb.Copy(llb.Local("src"), "hello-world/go.mod", ".")).
-			Run(llb.Shlex("go build -o hello-world main.go")).
-			Root()
-
-		def, err := baseStage.Marshal(ctx)
-		if err != nil {
-			return nil, err
-		}
-
-		r, err := gwClient.Solve(ctx, gwclient.SolveRequest{
-			Definition: def.ToPB(),
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		ref, err := r.SingleRef()
-		if err != nil {
-			return nil, errors.Wrap(err, "single ref")
-		}
-
-		_, err = ref.ReadDir(ctx, gwclient.ReadDirRequest{Path: "/"})
-		if err != nil {
-			return nil, errors.Wrap(err, "unlazy force execution")
-		}
-
 		result := gwclient.NewResult()
 
 		idx := atomic.Int32{}
 
-		for i := 0; i < 10000; i++ {
+		for i := 0; i < 100000; i++ {
 
-			randDir := fmt.Sprintf("/tmp/%s", strconv.Itoa(time.Now().Nanosecond()))
+			st, err := baseState(ctx, gwClient)
+			if err != nil {
+				return nil, err
+			}
 
-			appStage := llb.Scratch().
-				AddEnv("PATH", randDir).
-				File(llb.Mkdir("/tmp", os.ModeDir)).
-				File(llb.Mkdir(randDir, os.ModeDir)).
-				File(llb.Copy(baseStage, "/opt/hello-world", randDir))
+			file := fmt.Sprintf("/tmp/%d.txt", idx.Load())
+
+			appStage := llb.Image("docker.io/library/golang:1.17-alpine").
+				File(llb.Mkdir(file, os.ModeDir)).
+				Run(llb.Shlex("echo hi > " + file)).
+				Run(llb.Shlex("ls -l " + file)).
+				File(llb.Copy(*st, "/opt/hello-world", file))
 
 			def, err := appStage.Marshal(ctx)
 			if err != nil {
@@ -137,15 +144,8 @@ func logStatus(ch chan *client.SolveStatus) {
 		if status == nil {
 			break
 		}
-		fmt.Printf("status is %v\n", status)
 		for _, v := range status.Vertexes {
-			fmt.Printf("====vertex: %+v\n", v)
-		}
-		for _, s := range status.Statuses {
-			fmt.Printf("====status: %+v\n", s)
-		}
-		for _, l := range status.Logs {
-			fmt.Printf("====log: %s\n", string(l.Data))
+			fmt.Printf("%s - cached: %t\n", v.Name, v.Cached)
 		}
 	}
 }
